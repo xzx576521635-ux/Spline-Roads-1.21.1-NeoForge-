@@ -1,5 +1,5 @@
 # Spline Roads — 1.21.1 NeoForge port
-
+所有代码均由AI制作完成
 非官方 **Minecraft 1.21.1 / NeoForge** 移植版，基于 [ShiraAya/Spline-Roads-Release](https://github.com/ShiraAya/Spline-Roads-Release)
 的 2.0 源码，并包含大量兼容性、渲染、道路写入与地图/DH 集成修复。
 
