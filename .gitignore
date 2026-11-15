@@ -1,0 +1,18 @@
+# Gradle / build output
+.gradle/
+build/
+out/
+run/
+*.iml
+.idea/
+.vscode/
+
+# Optional integration jars (Distant Horizons API etc.)
+libs/*.jar
+!libs/README.md
+
+# Local test artifacts
+saves/
+mods_backup/
+*.jar
+!gradle/wrapper/gradle-wrapper.jar

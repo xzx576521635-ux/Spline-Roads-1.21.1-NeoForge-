@@ -1,0 +1,22 @@
+# Spline Roads — Non-Commercial License
+
+Copyright © 2026 ShiraAya
+
+All rights to the original Spline Roads mod and its copyrightable original content are reserved by the original copyright holder.
+
+**Permissions:**
+
+- Free use and modification of the mod.
+- Non-commercial redistribution of original or modified versions.
+- Creation and distribution of non-commercial derivative works.
+
+**Conditions:**
+
+- The original author must be properly credited.
+- All redistributed versions must retain the original copyright notice and this license.
+- Modified versions must clearly state that they are unofficial.
+- Commercial redistribution, selling, or monetizing copies of the mod requires prior written permission from the original copyright holder.
+
+Copyright ownership of the original mod is not transferred by this license.
+
+The mod is provided "as is", without warranty.

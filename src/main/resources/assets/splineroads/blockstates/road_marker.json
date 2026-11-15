@@ -1,0 +1,27 @@
+{
+  "variants": {
+    "kind=oak_leaves": {"model": "splineroads:block/marker_oak_leaves"},
+    "kind=birch_leaves": {"model": "splineroads:block/marker_birch_leaves"},
+    "kind=spruce_leaves": {"model": "splineroads:block/marker_spruce_leaves"},
+    "kind=cherry_leaves": {"model": "splineroads:block/marker_cherry_leaves"},
+    "kind=oak_log": {"model": "splineroads:block/marker_oak_log"},
+    "kind=birch_log": {"model": "splineroads:block/marker_birch_log"},
+    "kind=spruce_log": {"model": "splineroads:block/marker_spruce_log"},
+    "kind=cherry_log": {"model": "splineroads:block/marker_cherry_log"},
+    "kind=lamp": {"model": "splineroads:block/marker_lamp"},
+    "kind=lamp_blue": {"model": "splineroads:block/marker_lamp_blue"},
+    "kind=steel": {"model": "splineroads:block/marker_steel"},
+    "kind=dark_steel": {"model": "splineroads:block/marker_dark_steel"},
+    "kind=concrete": {"model": "splineroads:block/marker_concrete"},
+    "kind=soil": {"model": "splineroads:block/marker_soil"},
+    "kind=green": {"model": "splineroads:block/marker_green"},
+    "kind=flowers": {"model": "splineroads:block/marker_flowers"},
+    "kind=paint_white": {"model": "splineroads:block/marker_paint_white"},
+    "kind=paint_yellow": {"model": "splineroads:block/marker_paint_yellow"},
+    "kind=sign_green": {"model": "splineroads:block/marker_sign_green"},
+    "kind=sign_blue": {"model": "splineroads:block/marker_sign_blue"},
+    "kind=sign_white": {"model": "splineroads:block/marker_sign_white"},
+    "kind=pier": {"model": "splineroads:block/marker_pier"}
+  }
+}
+

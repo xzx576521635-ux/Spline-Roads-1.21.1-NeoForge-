@@ -1,0 +1,21 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="Spline Roads Non-Commercial License (META-INF/LICENSE.txt); third-party notices in META-INF/licenses"
+[[mods]]
+modId="splineroads"
+version="${mod_version}"
+displayName="Spline Roads"
+authors="ShiraAya, with AI-assisted implementation"
+description='''Independent endpoint-based solid spline roads. Generated with AI assistance. Ported to NeoForge 1.21.1.'''
+[[dependencies.splineroads]]
+modId="neoforge"
+type="required"
+versionRange="[21.1,)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.splineroads]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.21.2)"
+ordering="NONE"
+side="BOTH"
