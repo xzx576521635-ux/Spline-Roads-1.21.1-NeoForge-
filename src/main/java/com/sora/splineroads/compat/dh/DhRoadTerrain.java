@@ -1,5 +1,6 @@
 package com.sora.splineroads.compat.dh;
 
+import com.seibel.distanthorizons.api.enums.rendering.EDhApiDirection;
 import com.seibel.distanthorizons.api.interfaces.block.IDhApiBlockStateWrapper;
 import com.seibel.distanthorizons.api.methods.events.DhApiEventRegister;
 import com.seibel.distanthorizons.api.methods.events.abstractEvents.DhApiBlockColorOverrideEvent;
@@ -116,40 +117,25 @@ public final class DhRoadTerrain {
             int z = event.value.getBlockPosZ();
             long column = BlockPos.asLong(x, 0, z);
 
-            if (isDeck(state)) {
-               Boolean top = topAt(x, y, z);
-               if (top == null) {
-                  Integer topY = ROAD_TOP.get(column);
-                  if (topY != null) {
-                     top = y == topY;
-                  }
+            // Only the top block of a road column is driving surface. Fill blocks, sidewalks and
+            // the deck's sides/underside are buried or vertical; painting them bright asphalt (or
+            // lane-paint white) made them appear as long streaks running down Distant Horizons
+            // cliffs, which looks like the road is visible through the mountain.
+            Boolean top = topAt(x, y, z);
+            if (top == null) {
+               Integer topY = ROAD_TOP.get(column);
+               if (topY != null) {
+                  top = y == topY;
                }
+            }
 
-               if (Boolean.FALSE.equals(top)) {
-                  // Only the top layer is road surface. Sides and the bridge underside must not
-                  // be painted as bright asphalt; making them transparent also avoids the large
-                  // pale slabs that were visible when looking up from below.
-                  event.value.setColor(0, 0, 0, 0);
-                  return;
-               }
-
-               if (Boolean.TRUE.equals(top)) {
-                  Integer paint = PAINT_CELLS.get(BlockPos.asLong(x, y, z));
-                  if (paint != null) {
-                     event.value.setColor(paint >> 16 & 0xFF, paint >> 8 & 0xFF, paint & 0xFF);
-                  } else {
-                     event.value.setColor(ASPHALT_R, ASPHALT_G, ASPHALT_B);
-                  }
-
-                  return;
-               }
-
-               // No reliable world/LOD data yet: keep the whole column asphalt so a freshly
-               // generated LOD is not baked as stone.
-               event.value.setColor(ASPHALT_R, ASPHALT_G, ASPHALT_B);
+            if (Boolean.FALSE.equals(top)) {
+               event.value.setColor(0, 0, 0, 0);
                return;
             }
 
+            // Columns without any world/road data still get asphalt so a freshly generated LOD
+            // is not baked as stone.
             Integer paint = PAINT_CELLS.get(BlockPos.asLong(x, y, z));
             if (paint != null) {
                event.value.setColor(paint >> 16 & 0xFF, paint >> 8 & 0xFF, paint & 0xFF);
@@ -162,6 +148,13 @@ public final class DhRoadTerrain {
       DhApiEventRegister.on(DhApiBlockTextureOverrideEvent.class, new DhApiBlockTextureOverrideEvent() {
          @Override
          public void onBlockTextureOverridden(DhApiEventParam<DhApiBlockTextureOverrideEvent.EventParam> event) {
+            // DH asks per face. Only the up-facing face is driving surface: painting the side
+            // faces flat asphalt made buried fill/side blocks show up as dark asphalt patches and
+            // streaks on Distant Horizons cliff walls.
+            if (event.value.getFaceDirection() != EDhApiDirection.UP) {
+               return;
+            }
+
             if (isRoadSurface(stateOf(event.value.getBlockStateWrapper()))) {
                paintAsphalt(event.value);
             }

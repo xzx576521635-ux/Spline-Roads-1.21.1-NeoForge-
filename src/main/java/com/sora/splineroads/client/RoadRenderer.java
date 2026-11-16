@@ -997,15 +997,19 @@ public final class RoadRenderer {
    }
 
    /**
-    * Road VBO view distance in chunks. With Distant Horizons the real road geometry
-    * has to cover the band between the vanilla render distance and the DH LOD,
-    * otherwise that band only shows the flat LOD color plus block shadows and the
-    * road looks like it disappeared. Without DH this is simply the render distance.
+    * Road VBO view distance in chunks. Real geometry stays inside the vanilla render
+    * distance (plus a small margin) so that loaded terrain can occlude it.
+    *
+    * <p>Beyond that horizon only Distant Horizons LODs exist. DH terrain is far coarser
+    * than the real blocks, so drawing real road geometry out there lets roads poke
+    * through mountains (they are visible "through" the LOD terrain). The band is
+    * therefore represented by the DH LOD colours instead; {@code distantRoadExtraChunks}
+    * can re-enable the old behaviour at the cost of that visual artifact.</p>
     */
    static int viewChunks() {
       int chunks = Minecraft.getInstance().options.getEffectiveRenderDistance() + 2;
       if (ModList.get().isLoaded("distanthorizons")) {
-         chunks = Math.max(chunks, (Integer)RoadClientConfig.DISTANT_ROAD_CHUNKS.get());
+         chunks += (Integer)RoadClientConfig.DISTANT_ROAD_CHUNKS.get();
       }
 
       return chunks;
@@ -1332,11 +1336,20 @@ public final class RoadRenderer {
                visible.clear();
                glassVisible.clear();
                int renderChunks = viewChunks();
+               boolean distantHorizons = ModList.get().isLoaded("distanthorizons");
+               // With DH, real geometry must stay inside the terrain horizon: LODs are drawn after
+               // the vanilla stages without writing depth, so any real fragment past the loaded
+               // chunks appears in front of the coarse LOD mountains ("see-through" roads).
+               int horizonChunks = Math.max(1,
+                  Minecraft.getInstance().options.getEffectiveRenderDistance() + (Integer)RoadClientConfig.DISTANT_ROAD_CHUNKS.get());
 
                for (RoadRenderer.GpuSection sx : regions.values()) {
                   if (sx.bounds != null && (!sx.retained.isEmpty() || !sx.pieces.keySet().stream().noneMatch(ClientRoads::active))) {
                      double d = sx.bounds.distanceToSqr(camera);
-                     if (RoadVisibility.within(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, renderChunks)) {
+                     boolean inRange = distantHorizons
+                        ? RoadVisibility.inside(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, horizonChunks)
+                        : RoadVisibility.within(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, renderChunks);
+                     if (inRange) {
                         if (d > 12544.0) {
                            sx.distant = true;
                         } else if (d < 7744.0) {

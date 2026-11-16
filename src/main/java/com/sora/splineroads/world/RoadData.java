@@ -2649,6 +2649,13 @@ public final class RoadData extends SavedData {
    private static void requireBlockState(ServerLevel level, BlockPos pos, BlockState state) {
       BlockState actual = level.getBlockState(pos);
       if (!accepted(actual, state)) {
+         // A snow layer (or a plant) that sat on top of a removed road deck loses its support
+         // and is deleted by the world's shape updates, so it can never be restored. Treat the
+         // resulting air as the honest result instead of aborting the whole road edit.
+         if (actual.isAir() && (state.is(Blocks.SNOW) || state.getBlock() instanceof BushBlock)) {
+            return;
+         }
+
          throw new IllegalStateException("世界拒绝写入道路方块：" + pos.toShortString() + " target=" + state + " actual=" + actual);
       }
    }
@@ -2761,7 +2768,11 @@ public final class RoadData extends SavedData {
             requireBlockState(level, pos, state);
             BlockState stable = Block.updateFromNeighbourShapes(state, level, pos);
             if (!accepted(stable, state)) {
-               throw new IllegalStateException("世界拒绝写入道路方块：" + pos.toShortString() + " target=" + state + " supported=" + stable);
+               // Snow layers/plants sitting on a removed deck have no support: the world reports
+               // air for them. Keep the edit instead of rolling the whole deletion back.
+               if (!stable.isAir() || (!state.is(Blocks.SNOW) && !(state.getBlock() instanceof BushBlock))) {
+                  throw new IllegalStateException("世界拒绝写入道路方块：" + pos.toShortString() + " target=" + state + " supported=" + stable);
+               }
             }
 
             BlockEntity entity = level.getBlockEntity(pos);
@@ -4100,7 +4111,10 @@ public final class RoadData extends SavedData {
             // (grass blocks, dirt, stone, bedrock) must never be cleared by this pass;
             // the old "clear everything above the body" behaviour could remove the
             // whole surface layer or even bedrock on wide roads.
-            if (!current.canBeReplaced() && !current.is(BlockTags.LEAVES) && !current.is(BlockTags.LOGS)) {
+            // Snow layers are not "replaceable" in vanilla, so they used to survive the
+            // clearance pass and stayed on top of the deck (and later broke deletion).
+            boolean snowLayer = current.is(Blocks.SNOW);
+            if (!current.canBeReplaced() && !snowLayer && !current.is(BlockTags.LEAVES) && !current.is(BlockTags.LOGS)) {
                continue;
             }
 

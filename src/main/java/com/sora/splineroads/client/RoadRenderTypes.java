@@ -68,10 +68,14 @@ public final class RoadRenderTypes extends RenderType {
    }
 
    private static RenderType surface(ResourceLocation texture, boolean marking, boolean solid) {
-      float factor = solid ? 0.0F : (marking ? -2.0F : -1.0F);
+      // Constant depth bias only. A slope-dependent factor (-1 / -2) scales with the polygon's
+      // depth slope, so roads viewed edge-on (looking up a cliff) were pushed many blocks in
+      // front of the terrain behind them - visible as roads "through" Distant Horizons LOD
+      // mountains. The fixed `units` bias still keeps markings above the pavement and the
+      // pavement above the block surface, and it scales with distance resolution instead.
       float units = solid ? 0.0F : (marking ? -16.0F : -8.0F);
       LayeringStateShard offset = new LayeringStateShard(marking ? "road_marking_offset" : "road_surface_offset", () -> {
-         RenderSystem.polygonOffset(factor, units);
+         RenderSystem.polygonOffset(0.0F, units);
          RenderSystem.enablePolygonOffset();
       }, () -> {
          RenderSystem.polygonOffset(0.0F, 0.0F);

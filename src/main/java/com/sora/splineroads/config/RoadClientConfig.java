@@ -67,12 +67,13 @@ public final class RoadClientConfig {
          .defineInRange("coldRoadCacheMiB", 128, 0, 512);
       DISTANT_ROAD_CHUNKS = b.comment(
             new String[]{
-               "When Distant Horizons is installed, keep the real road VBO visible for at least this many chunks.",
-               "This is what fills the gap between the vanilla render distance and DH LOD, so roads do not",
-               "turn into a shadow-only silhouette in the distance. Only applies while DH is loaded."
+               "Extra chunks beyond the vanilla render distance that keep real road VBOs visible while",
+               "Distant Horizons is installed. Keep this at 0: DH LOD terrain is much coarser than the real",
+               "blocks, so real road geometry drawn over LOD-only terrain can be seen through mountains.",
+               "Values above 0 restore the old behaviour (roads drawn into the DH band, with that artifact)."
             }
          )
-         .defineInRange("distantRoadChunks", 24, 0, 64);
+         .defineInRange("distantRoadExtraChunks", 0, 0, 64);
       b.pop();
       b.push("tools");
       SPLIT_CONNECTION = b.defineEnum("splitConnection", RoadSlicing.Connection.CONTINUOUS);

@@ -276,7 +276,10 @@ public final class RoadEmbeddiumHandoff {
    private static void retireCompletedJob(Object token, Object render) {
       Object job = RoadTerrainHandoff.optionalJob(token);
       if (job != null && invoke(backend.job, render) == job) {
-         invoke(backend.setJob, render, null);
+         // NOTE: the (Object) cast matters. Without it javac treats the trailing `null` as the
+         // whole varargs array, so invoke() calls setJob with zero arguments and the JVM throws
+         // "wrong number of arguments: 0 expected: 1" while Sodium uploads chunk builds.
+         invoke(backend.setJob, render, (Object)null);
       }
    }
 
