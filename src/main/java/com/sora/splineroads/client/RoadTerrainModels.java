@@ -194,10 +194,13 @@ public final class RoadTerrainModels {
                      // readers (Xaero, Distant Horizons), otherwise the grass/stone filler model is
                      // sampled and roads blend into the terrain on the map.
                      return new RoadTerrainModels.TerrainModel(original, name.equals("road_collision"), true);
+                  } else if (name.equals("road_node")) {
+                     // Upstream hides the node block model in the world (only NodeRenderer draws the
+                     // endpoint marker, and only while the player holds a road tool). Keep the
+                     // asphalt colour sampling enabled for map/LOD readers.
+                     return new RoadTerrainModels.TerrainModel(original, false, true);
                   } else {
-                     return (BakedModel)(!name.equals("road_node")
-                        ? original
-                        : new RoadTerrainModels.TerrainModel(original, true));
+                     return (BakedModel)original;
                   }
                }
             }

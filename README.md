@@ -9,7 +9,7 @@
 
 ## 版本
 
-当前源码对应 `splineroads-2.0-varargfix.jar`（v64，稳定版）：
+当前源码对应 `splineroads-2.0-nodemodel.jar`（v67）：
 
 - 标记方块按“坐标 + 类别 + 多道路归属”记账，删除道路不会误删邻路标记；
 - 新建道路远端自动补放标记，Xaero 地图与 DH 远景可显示树木/路灯/绿化带/标线；
@@ -22,7 +22,14 @@
   - 真实路面几何严格限制在“整个 section 都在渲染距离内”，不再画进纯 LOD 区域；
   - 去掉 `polygonOffset` 的斜率因子，避免掠射角下路面深度被放大；
   - DH LOD 上色只作用于**柱顶**路面、纹理覆盖只作用于**朝上的面**，不再在山体岩壁上产生沥青块/条纹；
-- 修复 Sodium 区块上传交接里的反射 varargs 崩溃（`wrong number of arguments: 0 expected: 1`）。
+- 修复 Sodium 区块上传交接里的反射 varargs 崩溃（`wrong number of arguments: 0 expected: 1`）；
+- 端点方块模型恢复“只在手持道路工具时可见”（地图/LOD 上色不受影响）；
+- 为附属 mod 开放：`RoadTool` 可继承、支持 `ForceStraight` 标记（草稿直接使用 STRAIGHT 模式）。
+
+## 附属 mod
+
+- [Spline Roads: Quick Build](https://github.com/xzx576521635-ux/Spline-Roads-1.21.1-NeoForge-affiliated)
+  —— 快速建造工具：自动放端点、曲线/直线引导线、坡度与位移 HUD、强制直线开关。
 
 ## 构建
 

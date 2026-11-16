@@ -36,7 +36,11 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 
-public final class RoadTool extends Item {
+/**
+ * The road connector tool. Not final: add-on mods (e.g. Spline Roads: Quick Build) subclass it so
+ * the shared "is the player holding a road tool" checks in {@code RoadNetwork} keep working.
+ */
+public class RoadTool extends Item {
    public static Consumer<CompoundTag> openClient = t -> {
    };
 
@@ -176,8 +180,17 @@ public final class RoadTool extends Item {
                         width = data.inheritedWidth(a, var22, width, null);
                      }
 
+                     // The add-on's quick build tool can force a straight road: it writes
+                     // ForceStraight into the tool NBT (see splinequickbuild).
+                     RoadGeometry.Mode requestedMode = tool.getBoolean("ForceStraight")
+                        ? RoadGeometry.Mode.STRAIGHT
+                        : (
+                           ManualPlanner.inSession() && CurveControlNodes.controls(tool).isEmpty()
+                              ? RoadGeometry.Mode.STRAIGHT
+                              : RoadGeometry.Mode.AUTO
+                        );
                      RoadGeometry.Settings settings = new RoadGeometry.Settings(
-                           ManualPlanner.inSession() && CurveControlNodes.controls(tool).isEmpty() ? RoadGeometry.Mode.STRAIGHT : RoadGeometry.Mode.AUTO,
+                           requestedMode,
                            choice,
                            width,
                            saved.thickness(),
