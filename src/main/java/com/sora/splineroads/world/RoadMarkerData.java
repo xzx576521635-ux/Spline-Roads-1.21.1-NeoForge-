@@ -1,5 +1,7 @@
 package com.sora.splineroads.world;
 
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -23,7 +25,10 @@ public final class RoadMarkerData extends SavedData {
    private static final String FILE = "splineroads_markers";
    private final Map<UUID, Map<Long, RoadMarker.Kind>> markers = new HashMap<>();
    private final Map<Long, Set<UUID>> owners = new HashMap<>();
-   private final Set<Long> pending = new HashSet<>();
+   private static final long[] EMPTY_PENDING = new long[0];
+   private final LongOpenHashSet pending = new LongOpenHashSet();
+   private boolean rebuilt;
+   private boolean backlogDropped;
 
    public static RoadMarkerData get(ServerLevel level) {
       return (RoadMarkerData)level.getDataStorage()
@@ -81,8 +86,68 @@ public final class RoadMarkerData extends SavedData {
       }
    }
 
-   public Set<Long> pending() {
-      return Set.copyOf(this.pending);
+   public int pendingCount() {
+      return this.pending.size();
+   }
+
+   /** True once the full marker layout rebuild ran for this save (auto recovery runs once). */
+   public boolean rebuilt() {
+      return this.rebuilt;
+   }
+
+   public void rebuilt(boolean value) {
+      if (this.rebuilt != value) {
+         this.rebuilt = value;
+         this.setDirty();
+      }
+   }
+
+   public boolean backlogDropped() {
+      return this.backlogDropped;
+   }
+
+   /**
+    * Clears the persisted removal backlog. Older versions queued every marker that was not in
+    * their (partial) ledger, so the backlog holds hundreds of thousands of perfectly valid
+    * markers. Replaying it deleted the map colours; orphans are now re-detected per chunk.
+    */
+   public int dropPendingBacklog() {
+      int size = this.pending.size();
+      this.pending.clear();
+      this.backlogDropped = true;
+      if (size > 0) {
+         this.setDirty();
+      }
+      return size;
+   }
+
+   /**
+    * Removes and returns up to {@code limit} positions from the persisted removal backlog.
+    *
+    * <p>The backlog used to be copied with {@code Set.copyOf}, which rehashes the whole set.
+    * A world that accumulated about a million positions therefore froze the server tick for
+    * minutes every time the world was opened. Callers now take small slices and feed them
+    * into the removal queue over several ticks.</p>
+    */
+   public long[] takePending(int limit) {
+      if (this.pending.isEmpty() || limit <= 0) {
+         return EMPTY_PENDING;
+      }
+
+      int count = Math.min(limit, this.pending.size());
+      long[] out = new long[count];
+      LongIterator iterator = this.pending.iterator();
+
+      for (int i = 0; i < count && iterator.hasNext(); i++) {
+         out[i] = iterator.nextLong();
+      }
+
+      for (int i = 0; i < count; i++) {
+         this.pending.remove(out[i]);
+      }
+
+      this.setDirty();
+      return out;
    }
 
    public boolean isPending(long pos) {
@@ -143,14 +208,9 @@ public final class RoadMarkerData extends SavedData {
       }
 
       root.put("MarkerOwners", list);
-      long[] pendingPositions = new long[this.pending.size()];
-      int p = 0;
-
-      for (long pos : this.pending) {
-         pendingPositions[p++] = pos;
-      }
-
-      root.putLongArray("PendingRemovals", pendingPositions);
+      root.putLongArray("PendingRemovals", this.pending.toLongArray());
+      root.putBoolean("Rebuilt", this.rebuilt);
+      root.putBoolean("BacklogDropped", this.backlogDropped);
       return root;
    }
 
@@ -179,6 +239,9 @@ public final class RoadMarkerData extends SavedData {
       for (long pos : root.getLongArray("PendingRemovals")) {
          data.pending.add(pos);
       }
+
+      data.rebuilt = root.getBoolean("Rebuilt");
+      data.backlogDropped = root.getBoolean("BacklogDropped");
 
       return data;
    }

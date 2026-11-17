@@ -133,6 +133,14 @@ public final class RoadRenderer {
    private static long uploadFrames;
    private static long uploadZeroFrames;
    private static long packedFaces;
+   private static long frameSerial;
+   private static long meshBuilds;
+   private static long meshNanos;
+   private static long meshMaxNanos;
+   private static long meshLogWindow = System.nanoTime();
+   private static int pendingStallFrames;
+   private static long uploadStallCancels;
+   private static final Map<RoadRenderMesh.Section, Long> uploadStalls = new HashMap<>();
    private static boolean extendedEncoding;
    private static long useClock;
    private static long retainedBytes;
@@ -600,6 +608,8 @@ public final class RoadRenderer {
 
       clearPreviewBuffer();
       RoadGpuTimer.reset();
+      uploadStalls.clear();
+      pendingStallFrames = 0;
       clearPreviewFurniture();
       previewRecords.clear();
       previewContextRevision++;
@@ -1006,6 +1016,86 @@ public final class RoadRenderer {
     * therefore represented by the DH LOD colours instead; {@code distantRoadExtraChunks}
     * can re-enable the old behaviour at the cost of that visual artifact.</p>
     */
+   /**
+    * Diagnostic dump of GPU sections near a position ({@code /srclient sections}). Used to tell
+    * "section missing", "no active pieces" and "no uploaded vertices" apart.
+    */
+   public static java.util.List<String> debugSections(double x, double y, double z) {
+      java.util.List<String> out = new java.util.ArrayList<>();
+      if (regions == null) {
+         return out;
+      }
+
+      net.minecraft.world.phys.Vec3 camera = new net.minecraft.world.phys.Vec3(x, y, z);
+      for (RoadRenderer.GpuSection sx : regions.values()) {
+         if (sx.bounds == null || sx.bounds.distanceToSqr(camera) > 16384.0) {
+            continue;
+         }
+
+         int active = 0;
+         for (java.util.UUID id : sx.pieces.keySet()) {
+            if (ClientRoads.active(id)) {
+               active++;
+            }
+         }
+
+         out.add(
+            String.format(
+               "sec %d/%d/%d  pieces=%d active=%d retained=%d  near=%d far=%d surface=%d  dirty=%s  ready=%s usable=%s vis=%s  bounds=%s",
+               sx.key.x(),
+               sx.key.y(),
+               sx.key.z(),
+               sx.pieces.size(),
+               active,
+               sx.retained.size(),
+               sx.nearVertices,
+               sx.farVertices,
+               sx.surfaceVertices,
+               sx.dirty,
+               handoffReady(sx),
+               regionUsable(sx.key),
+               visible.contains(sx),
+               sx.bounds
+            )
+         );
+      }
+
+      return out;
+   }
+
+   /** True when no road mesh is queued, running or waiting for upload. */
+   public static boolean buildQueueIdle() {
+      return dirty.isEmpty() && jobs.isEmpty() && pendingUpload == null;
+   }
+
+   private static void meshBuilt(long nanos) {
+      meshBuilds++;
+      meshNanos += nanos;
+      meshMaxNanos = Math.max(meshMaxNanos, nanos);
+   }
+
+   /** Logs how much worker time went into road meshes (world entry / wide sync storms). */
+   private static void logMeshProgress() {
+      long now = System.nanoTime();
+      boolean idle = buildQueueIdle();
+      if (meshBuilds == 0L || !idle && now - meshLogWindow < 3_000_000_000L) {
+         return;
+      }
+
+      org.apache.logging.log4j.LogManager.getLogger("SplineRoads/performance")
+         .info(
+            "SR client meshes: {} built, {} ms total (max {} ms), queue {}",
+            meshBuilds,
+            meshNanos / 1_000_000L,
+            meshMaxNanos / 1_000_000L,
+            idle ? "drained" : dirty.size() + jobs.size()
+         );
+      meshBuilds = 0L;
+      meshNanos = 0L;
+      meshMaxNanos = 0L;
+      meshLogWindow = now;
+   }
+
    static int viewChunks() {
       int chunks = Minecraft.getInstance().options.getEffectiveRenderDistance() + 2;
       if (ModList.get().isLoaded("distanthorizons")) {
@@ -1230,7 +1320,10 @@ public final class RoadRenderer {
                      generation,
                      CompletableFuture.supplyAsync(
                         () -> {
-                           if (generation == epoch && version == versions.getOrDefault(id, 0)) {
+                           long buildStarted = System.nanoTime();
+
+                           try {
+                              if (generation == epoch && version == versions.getOrDefault(id, 0)) {
                               RoadRenderer.MeshResult var16;
                               try (RoadPlanningBudget scope = RoadPlanningBudget.cancellable(
                                     "客户端道路网格", () -> cancelled.get() || generation != epoch || version != versions.getOrDefault(id, 0)
@@ -1261,8 +1354,11 @@ public final class RoadRenderer {
                               }
 
                               return var16;
-                           } else {
-                              return new RoadRenderer.MeshResult(Map.of(), null);
+                              } else {
+                                 return new RoadRenderer.MeshResult(Map.of(), null);
+                              }
+                           } finally {
+                              meshBuilt(System.nanoTime() - buildStarted);
                            }
                         },
                         WORKER
@@ -1275,6 +1371,8 @@ public final class RoadRenderer {
             }
          }
       }
+
+      logMeshProgress();
    }
 
    @SubscribeEvent
@@ -1346,9 +1444,17 @@ public final class RoadRenderer {
                for (RoadRenderer.GpuSection sx : regions.values()) {
                   if (sx.bounds != null && (!sx.retained.isEmpty() || !sx.pieces.keySet().stream().noneMatch(ClientRoads::active))) {
                      double d = sx.bounds.distanceToSqr(camera);
-                     boolean inRange = distantHorizons
-                        ? RoadVisibility.inside(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, horizonChunks)
-                        : RoadVisibility.within(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, renderChunks);
+                     boolean inRange;
+                     if (distantHorizons) {
+                        // Loaded terrain can occlude correctly, so a normal bounds test is fine and
+                        // avoids dropping sections that straddle the horizon. Only sections without
+                        // any loaded chunk (pure LOD area) need the strict test.
+                        inRange = RoadTerrainModels.regionLoaded(sx.key)
+                           ? RoadVisibility.within(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, renderChunks)
+                           : RoadVisibility.inside(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, horizonChunks);
+                     } else {
+                        inRange = RoadVisibility.within(sx.bounds.minX, sx.bounds.minZ, sx.bounds.maxX, sx.bounds.maxZ, camera.x, camera.z, renderChunks);
+                     }
                      if (inRange) {
                         if (d > 12544.0) {
                            sx.distant = true;
@@ -1964,13 +2070,14 @@ public final class RoadRenderer {
 
    private static int uploadVisible() {
       int uploads = 0;
+      frameSerial++;
       pollVisibleLight();
       if (pendingUpload == null) {
          RoadRenderer.GpuSection candidate = null;
          double closest = Double.POSITIVE_INFINITY;
 
          for (RoadRenderer.GpuSection s : visible) {
-            if (s.dirty && handoffReady(s) && regionUsable(s.key)) {
+            if (s.dirty && handoffReady(s) && regionUsable(s.key) && uploadStalls.getOrDefault(s.key, 0L) <= frameSerial) {
                double d = s.bounds.distanceToSqr(new Vec3(cameraPosition.x(), cameraPosition.y(), cameraPosition.z()));
                if (d < closest) {
                   closest = d;
@@ -1981,6 +2088,7 @@ public final class RoadRenderer {
 
          if (candidate != null) {
             pendingUpload = new RoadRenderer.Upload(candidate);
+            pendingStallFrames = 0;
          }
       }
 
@@ -1994,7 +2102,23 @@ public final class RoadRenderer {
             }
 
             if (pendingUpload.complete) {
+               uploadStalls.remove(pendingUpload.section.key);
                pendingUpload = null;
+               pendingStallFrames = 0;
+            } else if (before == packedFaces) {
+               // No new faces were packed this frame: the upload is blocked (upload budget,
+               // terrain handoff or a driver error). Do not let it starve every other section
+               // forever; cancel it and skip that section for a while, then retry.
+               if (++pendingStallFrames >= 60) {
+                  RoadRenderMesh.Section stalled = pendingUpload.section.key;
+                  pendingUpload.cancel();
+                  pendingUpload = null;
+                  pendingStallFrames = 0;
+                  uploadStallCancels++;
+                  uploadStalls.put(stalled, frameSerial + 400L);
+               }
+            } else {
+               pendingStallFrames = 0;
             }
          } catch (RuntimeException var8) {
             pendingUpload.cancel();
@@ -2004,6 +2128,69 @@ public final class RoadRenderer {
       }
 
       return uploads;
+   }
+
+   /**
+    * Diagnostic dump for {@code /srclient uploads}: why sections are not being drawn after a
+    * rebuild (stalled upload, exhausted budget, sign reserve).
+    */
+   public static java.util.List<String> uploaderReport() {
+      java.util.List<String> out = new java.util.ArrayList<>();
+      RoadRenderer.Upload p = pendingUpload;
+      out.add(
+         String.format(
+            java.util.Locale.ROOT,
+            "upload: frames=%d zero=%d cancel=%d stallCancel=%d packed=%d dirtyRoads=%d runningJobs=%d",
+            uploadFrames,
+            uploadZeroFrames,
+            uploadCancels,
+            uploadStallCancels,
+            packedFaces,
+            dirty.size(),
+            jobs.size()
+         )
+      );
+      if (p == null) {
+         out.add("upload pending: none");
+      } else {
+         out.add(
+            "upload pending: sec " + p.section.key.x() + "/" + p.section.key.z()
+               + "  batch=" + p.batchIndex + "/" + p.batches.size()
+               + " piece=" + p.pieceIndex + "/" + p.pieces.size()
+               + " verts=" + p.vertices
+               + " stallFrames=" + pendingStallFrames
+               + "  dirty=" + p.section.dirty
+         );
+      }
+
+      out.add(RoadUploadBudget.debug() + "  signPending=" + SmartSignClient.pendingUploadBytes());
+      out.add(RoadUploadBudget.metrics());
+
+      Vec3 camera = new Vec3(cameraPosition.x(), cameraPosition.y(), cameraPosition.z());
+      int listed = 0;
+
+      for (RoadRenderer.GpuSection s : regions.values()) {
+         if (!s.dirty || listed >= 8) {
+            continue;
+         }
+
+         listed++;
+         out.add(
+            String.format(
+               java.util.Locale.ROOT,
+               "dirty sec %d/%d  dist=%.0f  pieces=%d near=%d surface=%d  stalledFor=%d",
+               s.key.x(),
+               s.key.z(),
+               Math.sqrt(s.bounds == null ? 0.0 : s.bounds.distanceToSqr(camera)),
+               s.pieces.size(),
+               s.nearVertices,
+               s.surfaceVertices,
+               Math.max(0L, uploadStalls.getOrDefault(s.key, 0L) - frameSerial)
+            )
+         );
+      }
+
+      return out;
    }
 
    static String uploadMetrics() {

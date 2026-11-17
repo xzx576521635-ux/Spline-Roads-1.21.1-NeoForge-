@@ -84,6 +84,8 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedData.Factory;
@@ -661,6 +663,24 @@ public final class RoadData extends SavedData {
       return !this.index.atNode(pos).isEmpty();
    }
 
+   /**
+    * Removes an endpoint that no road uses yet (quick build wrench). Refuses when the endpoint is
+    * still referenced by a road or a junction, matching the manual planner behaviour.
+    */
+   public void eraseEndpoint(ServerPlayer player, BlockPos pos) {
+      ServerLevel level = player.serverLevel();
+      NodeEntity node = requireNode(level, pos, player);
+      requireOwner(player, node.owner);
+      if (this.linked(pos) || AutoJunctions.center(this, pos) != null) {
+         throw new IllegalArgumentException("端点仍被道路使用，请先删除相关道路");
+      }
+
+      // Unlinked endpoint: no road/junction state references it, so removing the block directly is
+      // enough. The full replaceAssembly pipeline was only needed for road edits and took seconds.
+      level.removeBlock(pos, false);
+      this.setDirty();
+   }
+
    public static void requireOwner(ServerPlayer player, UUID owner) {
       if (owner != null && !owner.equals(player.getUUID()) && !player.hasPermissions(2)) {
          throw new IllegalArgumentException("只能编辑自己创建的道路和端点");
@@ -731,9 +751,20 @@ public final class RoadData extends SavedData {
       if (settings.style() == RoadGeometry.Style.TOLL) {
          throw new IllegalArgumentException("请使用收费站生成器");
       } else {
-         return TollRoads.reverseConnection(this, a, b)
+         // Add-ons may charge for new roads (survival balance). Edits (replace != null) are free.
+         boolean charge = replace == null;
+         if (charge) {
+            RoadCostHooks.reserve(player, level, a, b, settings);
+         }
+
+         RoadRecord record = TollRoads.reverseConnection(this, a, b)
             ? this.connectDirected(level, player, b, a, settings, replace, levelEnds, forceB, forceA, controlNodes)
             : this.connectDirected(level, player, a, b, settings, replace, levelEnds, forceA, forceB, controlNodes);
+         if (charge) {
+            RoadCostHooks.charge(player, level, a, b, settings);
+         }
+
+         return record;
       }
    }
 
@@ -4438,6 +4469,11 @@ public final class RoadData extends SavedData {
                             restoredBlocks.put(Long.valueOf(keyxxxxx), fillFallback);
                          } else if (original != null) {
                             restoredBlocks.put(Long.valueOf(keyxxxxx), original);
+                         } else {
+                            // A collider with no terrain record was placed by a repair pass over
+                            // air/void. Leaving it in place is exactly what produced invisible,
+                            // walkable collider strips where a road used to be.
+                            restoredBlocks.put(Long.valueOf(keyxxxxx), Blocks.AIR.defaultBlockState());
                          }
                      } else if (TunnelAir.isAirSpace(currentx) || currentx.equals(this.sidewalkPlaced.get(keyxxxxx))) {
                         if (original != null) {
@@ -4454,6 +4490,12 @@ public final class RoadData extends SavedData {
                RailbedRoads.sync(this, built, removed);
                this.sidewalkPlaced = new Long2ObjectOpenHashMap(sidewalks);
                this.apronPlaced = new LongOpenHashSet(edit.aprons());
+               if (!removed.isEmpty()) {
+                  // Colliders that a repair pass placed outside the road raster are not part of
+                  // `touched`, so the restore loop above cannot see them. Sweep the edited chunks
+                  // and release every collider that no remaining road owns.
+                  this.sweepOrphansAround(level, touched);
+               }
                if (!this.exactSplit) {
                   RampJunctions.sync(this, groups);
                }
@@ -4841,7 +4883,264 @@ public final class RoadData extends SavedData {
       }
    }
 
+   /** Roads whose chunk neighbourhood overlaps {@code chunk}; used for ownership checks. */
+   private List<RoadIndex.Built> nearbyRoads(ChunkPos chunk) {
+      HashSet<UUID> ids = new HashSet<>();
+
+      for (int dx = -1; dx <= 1; dx++) {
+         for (int dz = -1; dz <= 1; dz++) {
+            ids.addAll(this.index.inChunk(ChunkPos.asLong(chunk.x + dx, chunk.z + dz)));
+         }
+      }
+
+      return ids.stream().map(this.index.roads::get).filter(Objects::nonNull).toList();
+   }
+
+   /**
+    * True when a road that still exists covers this cell. The raster is authoritative; a mesh
+    * projection is used as a conservative second opinion so that a legitimate deck or support
+    * block is never mistaken for a leftover.
+    */
+   public boolean roadOwns(BlockPos pos, List<RoadIndex.Built> nearby) {
+      long key = pos.asLong();
+      if (this.sidewalkPlaced.containsKey(key) || this.apronPlaced.contains(key)) {
+         return true;
+      }
+
+      if (this.index.occupied(key)) {
+         return true;
+      }
+
+      RoadGeometry.V point = new RoadGeometry.V((double)pos.getX() + 0.5, (double)pos.getY() + 0.5, (double)pos.getZ() + 0.5);
+
+      for (RoadIndex.Built road : nearby) {
+         if (RoadQueries.contains(road.mesh, point, 1.0, 2.0)) {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   /** Restores a collider that no road owns to the terrain recorded when it was placed. */
+   private boolean releaseOrphanCell(ServerLevel level, BlockPos pos, BlockState state) {
+      long key = pos.asLong();
+      BlockState walkway = (BlockState)this.sidewalkPlaced.remove(key);
+      BlockState original = (BlockState)this.terrainOriginal.remove(key);
+      BlockState fill = (BlockState)this.terrainFill.remove(key);
+      this.apronPlaced.remove(key);
+      BlockState target;
+      if (walkway != null && !RoadBlocks.isCollider(walkway)) {
+         target = walkway;
+      } else if (original != null && !original.isAir() && !RoadBlocks.isCollider(original)) {
+         target = original;
+      } else if (fill != null && !fill.isAir() && !RoadBlocks.isCollider(fill)) {
+         target = fill;
+      } else {
+         RoadBlocks.Fill kept = state.hasProperty(RoadBlocks.Road.FILL) ? (RoadBlocks.Fill)state.getValue(RoadBlocks.Road.FILL) : RoadBlocks.Fill.NONE;
+         target = kept == RoadBlocks.Fill.NONE ? Blocks.AIR.defaultBlockState() : kept.state();
+      }
+
+      if (state.equals(target)) {
+         return false;
+      }
+
+      level.setBlock(pos, target, 3);
+      if (target.getFluidState().is(FluidTags.WATER)) {
+         level.scheduleTick(pos, Fluids.WATER, Fluids.WATER.getTickDelay(level));
+      }
+
+      return true;
+   }
+
+   /**
+    * Releases every collider inside {@code chunk} that is not covered by any road that still
+    * exists. Only chunk sections whose palette contains a collider are scanned, so a chunk
+    * without leftovers costs almost nothing.
+    */
+   private int sweepOrphanChunk(ServerLevel level, ChunkPos chunk) {
+      LevelChunk loaded = level.getChunk(chunk.x, chunk.z);
+      List<RoadIndex.Built> nearby = this.nearbyRoads(chunk);
+      int restored = 0;
+      LevelChunkSection[] sections = loaded.getSections();
+      int baseY = loaded.getMinBuildHeight();
+      int baseX = chunk.getMinBlockX();
+      int baseZ = chunk.getMinBlockZ();
+
+      for (int index = 0; index < sections.length; index++) {
+         LevelChunkSection section = sections[index];
+         if (!section.maybeHas(RoadBlocks::isCollider)) {
+            continue;
+         }
+
+         int sectionY = baseY + index * 16;
+
+         for (int y = 0; y < 16; y++) {
+            for (int z = 0; z < 16; z++) {
+               for (int x = 0; x < 16; x++) {
+                  BlockState state = section.getBlockState(x, y, z);
+                  if (!RoadBlocks.isCollider(state)) {
+                     continue;
+                  }
+
+                  BlockPos pos = new BlockPos(baseX + x, sectionY + y, baseZ + z);
+                  if (!this.roadOwns(pos, nearby) && this.releaseOrphanCell(level, pos, state)) {
+                     restored++;
+                  }
+               }
+            }
+         }
+      }
+
+      if (restored > 0) {
+         this.setDirty();
+      }
+
+      return restored;
+   }
+
+   private void sweepOrphansAround(ServerLevel level, Set<Long> cells) {
+      HashSet<Long> chunks = new HashSet<>();
+
+      for (long key : cells) {
+         chunks.add(ChunkPos.asLong(BlockPos.getX(key) >> 4, BlockPos.getZ(key) >> 4));
+         if (chunks.size() >= 256) {
+            break;
+         }
+      }
+
+      for (long chunkKey : chunks) {
+         ChunkPos chunk = new ChunkPos(chunkKey);
+         if (level.hasChunk(chunk.x, chunk.z)) {
+            try {
+               this.sweepOrphanChunk(level, chunk);
+            } catch (RuntimeException ignored) {
+               // A sweep failure must never abort the road edit that triggered it.
+            }
+         }
+      }
+   }
+
+   /** Result of {@code /sr colliders audit|prune}. */
+   public static record ColliderAudit(
+      int chunks, int colliders, int orphans, int restored, int withTerrain, BlockPos min, BlockPos max, List<BlockPos> samples
+   ) {
+   }
+
+   /**
+    * Scans loaded chunks around {@code center} for collider blocks that no road owns, optionally
+    * releasing them. Used by {@code /sr colliders audit|prune} to clean up worlds that already
+    * contain leftovers from older versions.
+    */
+   public RoadData.ColliderAudit auditOrphanColliders(ServerLevel level, BlockPos center, int radius, boolean apply) {
+      int chunkRadius = Math.max(1, (radius + 15) / 16);
+      int centerChunkX = center.getX() >> 4;
+      int centerChunkZ = center.getZ() >> 4;
+      int chunks = 0;
+      int colliders = 0;
+      int orphans = 0;
+      int restored = 0;
+      int withTerrain = 0;
+      BlockPos min = null;
+      BlockPos max = null;
+      List<BlockPos> samples = new ArrayList<>();
+      long radiusSquared = (long)radius * (long)radius;
+
+      for (int cx = centerChunkX - chunkRadius; cx <= centerChunkX + chunkRadius; cx++) {
+         for (int cz = centerChunkZ - chunkRadius; cz <= centerChunkZ + chunkRadius; cz++) {
+            if (!level.hasChunk(cx, cz)) {
+               continue;
+            }
+
+            chunks++;
+            LevelChunk loaded = level.getChunk(cx, cz);
+            List<RoadIndex.Built> nearby = this.nearbyRoads(loaded.getPos());
+            LevelChunkSection[] sections = loaded.getSections();
+            int baseY = loaded.getMinBuildHeight();
+            int baseX = loaded.getPos().getMinBlockX();
+            int baseZ = loaded.getPos().getMinBlockZ();
+
+            for (int index = 0; index < sections.length; index++) {
+               LevelChunkSection section = sections[index];
+               if (!section.maybeHas(RoadBlocks::isCollider)) {
+                  continue;
+               }
+
+               int sectionY = baseY + index * 16;
+
+               for (int y = 0; y < 16; y++) {
+                  for (int z = 0; z < 16; z++) {
+                     for (int x = 0; x < 16; x++) {
+                        BlockState state = section.getBlockState(x, y, z);
+                        if (!RoadBlocks.isCollider(state)) {
+                           continue;
+                        }
+
+                        int worldX = baseX + x;
+                        int worldY = sectionY + y;
+                        int worldZ = baseZ + z;
+                        long dx = worldX - center.getX();
+                        long dz = worldZ - center.getZ();
+                        if (dx * dx + dz * dz > radiusSquared) {
+                           continue;
+                        }
+
+                        colliders++;
+                        BlockPos pos = new BlockPos(worldX, worldY, worldZ);
+                        if (this.roadOwns(pos, nearby)) {
+                           continue;
+                        }
+
+                        orphans++;
+                        if (this.terrainOriginal.containsKey(pos.asLong())) {
+                           withTerrain++;
+                        }
+
+                        if (samples.size() < 8) {
+                           samples.add(pos);
+                        }
+
+                        if (min == null) {
+                           min = pos;
+                           max = pos;
+                        } else {
+                           min = new BlockPos(
+                              Math.min(min.getX(), worldX), Math.min(min.getY(), worldY), Math.min(min.getZ(), worldZ)
+                           );
+                           max = new BlockPos(
+                              Math.max(max.getX(), worldX), Math.max(max.getY(), worldY), Math.max(max.getZ(), worldZ)
+                           );
+                        }
+
+                        if (apply && this.releaseOrphanCell(level, pos, state)) {
+                           restored++;
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
+
+      if (apply && restored > 0) {
+         this.setDirty();
+      }
+
+      return new RoadData.ColliderAudit(chunks, colliders, orphans, restored, withTerrain, min, max, List.copyOf(samples));
+   }
+
    public void repairChunk(ServerLevel level, ChunkPos chunk) {
+      long started = System.nanoTime();
+
+      try {
+         this.repairChunkInternal(level, chunk);
+      } finally {
+         RoadPerf.repair(System.nanoTime() - started);
+         RoadPerf.maybeLog();
+      }
+   }
+
+   private void repairChunkInternal(ServerLevel level, ChunkPos chunk) {
       if (this.deckRepaired.add(chunk.toLong())) {
          if (this.deckRepaired.size() > 8192) {
             this.deckRepaired.clear();
@@ -4866,10 +5165,13 @@ public final class RoadData extends SavedData {
             level, chunk, adoptIds.stream().map(this.index.roads::get).filter(Objects::nonNull).toList()
          );
 
+         HashSet<UUID> deckDataPresent = new HashSet<>();
+
          for (RoadIndex.Built road : deckRoads) {
             for (int x = chunk.x * 16; x < chunk.x * 16 + 16; x++) {
                for (int z = chunk.z * 16; z < chunk.z * 16 + 16; z++) {
                   for (Entry<RoadRaster.Cell, List<RoadRaster.Box>> deck : road.prepareCollision().deckColumn(x, z).entrySet()) {
+                     deckDataPresent.add(road.record.id());
                      RoadRaster.Cell cell = deck.getKey();
                      BlockPos p = new BlockPos(cell.x(), cell.y(), cell.z());
                      long key = p.asLong();
@@ -4885,6 +5187,12 @@ public final class RoadData extends SavedData {
 
                      BlockState target = this.collisionState(key, current, List.of(road), null, false, List.of(road));
                      if (RoadBlocks.isCollider(target)) {
+                        // Remember what was here before the repair placed a collider. Without this
+                        // record a later deletion cannot restore the cell and leaves an invisible,
+                        // walkable collider behind ("ghost road"). Air needs no record.
+                        if (!current.isAir()) {
+                           this.terrainOriginal.putIfAbsent(key, current);
+                        }
                         level.setBlock(p, target, 3);
                         deckChanged = true;
                      }
@@ -4899,6 +5207,13 @@ public final class RoadData extends SavedData {
          int meshPlaced = 0;
 
          for (RoadIndex.Built road : deckRoads) {
+            if (deckDataPresent.contains(road.record.id())) {
+               // The raster deck data exists and the loop above already filled missing cells,
+               // so the expensive mesh scan cannot add anything. It used to read up to 2048
+               // block positions per road per chunk on every chunk load.
+               continue;
+            }
+
             double sidewalk = road.record.settings().options().sidewalk().width();
 
             for (RoadGeometry.Sample sample : road.mesh.samples()) {
@@ -4932,6 +5247,9 @@ public final class RoadData extends SavedData {
                      continue;
                   }
 
+                  if (!current.isAir()) {
+                     this.terrainOriginal.putIfAbsent(p.asLong(), current);
+                  }
                   level.setBlock(p, ((Block)SplineRoads.COLLIDER.get()).defaultBlockState(), 3);
                   deckChanged = true;
                   meshPlaced++;

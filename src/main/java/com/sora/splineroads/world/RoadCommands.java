@@ -1,6 +1,7 @@
 package com.sora.splineroads.world;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.sora.splineroads.SplineRoads;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
@@ -97,6 +98,46 @@ public final class RoadCommands {
             .then(
                ((RequiredArgumentBuilder)Commands.argument("r", IntegerArgumentType.integer(1, 1024)).executes(c -> start(c, false, false, "")))
                   .then(Commands.argument("h", IntegerArgumentType.integer(1, 1024)).executes(c -> start(c, false, true, "")))
+            )
+      );
+      root.then(
+         Commands.literal("markers")
+            .then(Commands.literal("prune").executes(c -> pruneMarkers(c.getSource())))
+            .then(
+               Commands.literal("orphans")
+                  .executes(c -> orphanMarkers(c.getSource(), 64, false))
+                  .then(
+                     Commands.literal("remove")
+                        .executes(c -> orphanMarkers(c.getSource(), 64, true))
+                        .then(
+                           Commands.argument("radius", IntegerArgumentType.integer(8, 160))
+                              .executes(c -> orphanMarkers(c.getSource(), IntegerArgumentType.getInteger(c, "radius"), true))
+                        )
+                  )
+                  .then(
+                     Commands.argument("radius", IntegerArgumentType.integer(8, 160))
+                        .executes(c -> orphanMarkers(c.getSource(), IntegerArgumentType.getInteger(c, "radius"), false))
+                  )
+            )
+            .then(Commands.literal("rebuild").executes(c -> rebuildMarkers(c.getSource())))
+      );
+      root.then(
+         Commands.literal("colliders")
+            .then(
+               Commands.literal("audit")
+                  .executes(c -> colliders(c.getSource(), 64, false))
+                  .then(
+                     Commands.argument("radius", IntegerArgumentType.integer(8, 160))
+                        .executes(c -> colliders(c.getSource(), IntegerArgumentType.getInteger(c, "radius"), false))
+                  )
+            )
+            .then(
+               Commands.literal("prune")
+                  .executes(c -> colliders(c.getSource(), 64, true))
+                  .then(
+                     Commands.argument("radius", IntegerArgumentType.integer(8, 160))
+                        .executes(c -> colliders(c.getSource(), IntegerArgumentType.getInteger(c, "radius"), true))
+                  )
             )
       );
       dispatcher.register(root);
@@ -292,5 +333,132 @@ public final class RoadCommands {
    }
 
    private static record Species(TagKey<Block> logs, Block leaves) {
+   }
+
+   /**
+    * Removes marker blocks whose owning road no longer exists and drops their ledger entries.
+    * Chunks that are not loaded are skipped (run the command again after visiting them).
+    */
+   private static int pruneMarkers(CommandSourceStack source) {
+      ServerLevel level = source.getLevel();
+      RoadData data = RoadData.get(level);
+      RoadMarkerData markers = RoadMarkerData.get(level);
+      int removed = 0;
+      int skipped = 0;
+      int roads = 0;
+
+      for (java.util.UUID id : new java.util.ArrayList<>(markers.roads())) {
+         if (data.index.roads.containsKey(id) || data.streets.containsKey(id)) {
+            continue;
+         }
+
+         Map<Long, RoadMarker.Kind> positions = markers.positions(id);
+         boolean complete = true;
+
+         for (long key : new java.util.ArrayList<>(positions.keySet())) {
+            BlockPos pos = BlockPos.of(key);
+            if (!level.isLoaded(pos)) {
+               complete = false;
+               skipped++;
+               continue;
+            }
+
+            if (level.getBlockState(pos).is((Block)SplineRoads.MARKER.get()) && markers.roadsAt(key).size() <= 1) {
+               level.removeBlock(pos, false);
+               removed++;
+            }
+         }
+
+         if (complete) {
+            markers.remove(id);
+            roads++;
+         }
+      }
+
+      markers.setDirty();
+      int removedFinal = removed;
+      int skippedFinal = skipped;
+      int roadsFinal = roads;
+      source.sendSuccess(
+         () -> Component.literal(
+            "SR 标记清理：移除 " + removedFinal + " 个标记方块，清理 " + roadsFinal + " 条已删除道路的账本"
+               + (skippedFinal > 0 ? "；另有 " + skippedFinal + " 个在未加载区块，请再运行一次" : "")
+         ),
+         true
+      );
+      return removed;
+   }
+
+   /**
+    * Audits (or removes) marker blocks that have no ledger owner and are not next to any
+    * existing road. Default is a dry run so a large radius cannot surprise the player.
+    */
+   private static int orphanMarkers(CommandSourceStack source, int radius, boolean apply) {
+      ServerLevel level = source.getLevel();
+      java.util.HashMap<RoadMarker.Kind, Integer> histogram = new java.util.HashMap<>();
+      int found;
+
+      try {
+         found = RoadMarkerBuilder.pruneUntracked(
+            level, BlockPos.containing(source.getPosition()), radius, apply, histogram
+         );
+      } catch (Throwable failure) {
+         org.apache.logging.log4j.LogManager.getLogger("SplineRoads").error("SR orphan marker scan failed", failure);
+         String detail = failure.getClass().getSimpleName()
+            + (failure.getMessage() == null ? "" : ": " + failure.getMessage());
+         source.sendFailure(Component.literal("SR 无主标记扫描失败：" + detail));
+         return 0;
+      }
+      String kinds = histogram.entrySet()
+         .stream()
+         .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+         .limit(6)
+         .map(e -> e.getKey().getSerializedName() + "=" + e.getValue())
+         .reduce((a, b) -> a + ", " + b)
+         .orElse("-");
+      String message = (apply
+            ? "SR 无主标记清理：半径 " + radius + " 内移除 " + found + " 个（仅已加载区块）"
+            : "SR 无主标记检查：半径 " + radius + " 内发现 " + found
+               + " 个（未修改；确认后执行 /sr markers orphans remove " + radius + "）")
+         + "；种类：" + kinds;
+      source.sendSuccess(() -> Component.literal(message), true);
+      return found;
+   }
+
+   /** Recomputes and re-places the marker layout of every road (map colours). */
+   private static int rebuildMarkers(CommandSourceStack source) {
+      RoadData data = RoadData.get(source.getLevel());
+      int roads = RoadMarkerBuilder.scheduleRebuild(data, "command");
+      source.sendSuccess(
+         () -> Component.literal("SR 标记重建：已排队 " + roads + " 条道路，后台分批计算并补放（不会删除现有标记）"),
+         true
+      );
+      return roads;
+   }
+
+   /**
+    * Reports (audit) or releases (prune) collider blocks that no road owns any more. These are
+    * the invisible, walkable, shadow-casting leftovers of deleted roads.
+    */
+   private static int colliders(CommandSourceStack source, int radius, boolean apply) {
+      ServerLevel level = source.getLevel();
+      RoadData data = RoadData.get(level);
+      BlockPos center = BlockPos.containing(source.getPosition());
+      RoadData.ColliderAudit audit = data.auditOrphanColliders(level, center, radius, apply);
+      String where = audit.min() == null
+         ? "范围内没有残留碰撞方块"
+         : "范围 " + audit.min().toShortString() + " ~ " + audit.max().toShortString();
+      String samples = audit.samples().isEmpty()
+         ? ""
+         : "；示例 " + audit.samples().stream().map(BlockPos::toShortString).reduce((a, b) -> a + " " + b).orElse("");
+      String message = (apply ? "SR 碰撞方块清理：" : "SR 碰撞方块检查：")
+         + "扫描 " + audit.chunks() + " 个区块、"
+         + audit.colliders() + " 个碰撞方块，无主 "
+         + audit.orphans() + " 个（其中有原始记录 "
+         + audit.withTerrain() + " 个）"
+         + (apply ? "，已恢复 " + audit.restored() + " 个" : "")
+         + "；" + where + samples;
+      source.sendSuccess(() -> Component.literal(message), true);
+      return audit.orphans();
    }
 }

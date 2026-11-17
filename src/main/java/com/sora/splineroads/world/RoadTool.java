@@ -44,7 +44,20 @@ public class RoadTool extends Item {
    public static Consumer<CompoundTag> openClient = t -> {
    };
 
-   public static boolean showsNodes(ItemStack stack) {
+   /** Add-ons (e.g. the quick build wrench) can make endpoints visible while holding their item. */
+   private static final java.util.List<java.util.function.Predicate<ItemStack>> NODE_VIEWERS =
+      new java.util.concurrent.CopyOnWriteArrayList<>();
+
+   public static void registerNodeViewer(java.util.function.Predicate<ItemStack> test) {
+      NODE_VIEWERS.add(test);
+   }
+
+   public static boolean showsNodes(ItemStack stack) {      for (java.util.function.Predicate<ItemStack> viewer : NODE_VIEWERS) {
+         if (viewer.test(stack)) {
+            return true;
+         }
+      }
+
       return stack.getItem() instanceof LanePointTool
          || stack.getItem() instanceof LaneRampTool
          || stack.getItem() instanceof ElevatedPointTool
@@ -95,7 +108,12 @@ public class RoadTool extends Item {
    }
 
    public RoadTool() {
-      super(new Properties().stacksTo(1));
+      this(new Properties().stacksTo(1));
+   }
+
+   /** Lets add-on tools (e.g. Spline Roads: Quick Build) add durability or other properties. */
+   protected RoadTool(Properties properties) {
+      super(properties);
    }
 
    public InteractionResult useOn(UseOnContext context) {

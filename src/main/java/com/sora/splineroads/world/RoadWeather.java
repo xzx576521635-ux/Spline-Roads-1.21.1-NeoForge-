@@ -16,11 +16,17 @@ import net.neoforged.neoforge.event.level.ChunkEvent.Load;
 public final class RoadWeather {
    @SubscribeEvent
    public static void loaded(Load event) {
+      long started = System.nanoTime();
       refresh(event.getChunk());
+      RoadPerf.heightmaps(System.nanoTime() - started);
 
       if (event.getLevel() instanceof ServerLevel level) {
+         long markerStart = System.nanoTime();
          RoadMarkerBuilder.chunkLoaded(level, event.getChunk());
+         RoadPerf.markers(System.nanoTime() - markerStart);
       }
+
+      RoadPerf.maybeLog();
    }
 
    public static boolean refresh(ChunkAccess chunk) {

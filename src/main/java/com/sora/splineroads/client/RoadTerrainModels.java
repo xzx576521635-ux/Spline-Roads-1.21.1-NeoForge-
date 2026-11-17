@@ -62,6 +62,7 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.fml.common.EventBusSubscriber.Bus;
+import org.apache.logging.log4j.LogManager;
 import net.neoforged.neoforge.client.ChunkRenderTypeSet;
 import net.neoforged.neoforge.client.event.ModelEvent.BakingCompleted;
 import net.neoforged.neoforge.client.event.ModelEvent.ModifyBakingResult;
@@ -176,15 +177,34 @@ public final class RoadTerrainModels {
       return false;
    }
 
+   private static boolean terrainModelsNeeded() {
+      RoadClientConfig.SurfaceBackend choice = (RoadClientConfig.SurfaceBackend)RoadClientConfig.SURFACE_BACKEND.get();
+      if (choice == RoadClientConfig.SurfaceBackend.TERRAIN) {
+         return true;
+      }
+
+      // AUTO selects the terrain backend only when a shader pack is active and DH is absent.
+      // Shader state can change after models are baked, so keep the wrappers whenever AUTO
+      // could reach that state at all. With DH installed AUTO stays on VBO.
+      return choice == RoadClientConfig.SurfaceBackend.AUTO && !ModList.get().isLoaded("distanthorizons");
+   }
+
    @SubscribeEvent
    public static void wrap(ModifyBakingResult event) {
+      // Wrapping every baked model costs tens of seconds on large packs (ModernFix reported
+      // ~29 s for splineroads). The wrappers are only useful for the "terrain" surface
+      // backend: it draws the road quads through the terrain block model. With Distant
+      // Horizons installed AUTO always uses the VBO backend, so skip them entirely there.
+      boolean terrainModels = terrainModelsNeeded();
+      LogManager.getLogger("SplineRoads")
+         .info("Terrain model wrapping {} (surface backend {})", terrainModels ? "enabled" : "skipped", RoadClientConfig.SURFACE_BACKEND.get());
       event.getModels()
          .replaceAll(
             (id, original) -> {
                if (!(id instanceof ModelResourceLocation) || id.getVariant().equals("inventory")) {
                   return (BakedModel)original;
                } else if (!id.id().getNamespace().equals("splineroads")) {
-                  return new RoadTerrainModels.TerrainModel(original, true);
+                  return terrainModels ? new RoadTerrainModels.TerrainModel(original, true) : (BakedModel)original;
                } else {
                   String name = id.id().getPath();
                   if (name.equals("road_block") || name.equals("road_slab")) {

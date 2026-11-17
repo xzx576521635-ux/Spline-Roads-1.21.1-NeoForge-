@@ -1,12 +1,12 @@
 package com.sora.splineroads.core;
 
-import java.lang.System.Logger;
-import java.lang.System.Logger.Level;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 public final class RoadTimings implements AutoCloseable {
-   private static final Logger LOG = System.getLogger("SplineRoads/performance");
+   private static final Logger LOG = LogManager.getLogger("SplineRoads/performance");
    private final long started = System.nanoTime();
    private long previous = this.started;
    private final String operation;
@@ -30,9 +30,7 @@ public final class RoadTimings implements AutoCloseable {
       this.phases.merge(phase, ms, Double::sum);
       this.previous = now;
       if (ms >= 1000.0 || Boolean.getBoolean("sr.profile")) {
-         LOG.log(
-            Level.INFO, "SR stage {0}/{1}: {2} ms, elapsed={3} ms", this.operation, phase, Math.round(ms), Math.round((double)(now - this.started) / 1000000.0)
-         );
+         LOG.info("SR stage {}/{}: {} ms, elapsed={} ms", this.operation, phase, Math.round(ms), Math.round((double)(now - this.started) / 1000000.0));
       }
    }
 
@@ -40,16 +38,14 @@ public final class RoadTimings implements AutoCloseable {
    public void close() {
       double total = (double)(System.nanoTime() - this.started) / 1000000.0;
       if (total >= 250.0 || Boolean.getBoolean("sr.profile")) {
-         LOG.log(
-            Level.INFO, "SR {0}: {1} ms, roads={2}, requested={3}, phases(ms)={4}", this.operation, Math.round(total), this.roads, this.edited, this.phases
-         );
+         LOG.info("SR {}: {} ms, roads={}, requested={}, phases(ms)={}", this.operation, Math.round(total), this.roads, this.edited, this.phases);
       }
    }
 
    public static void reportLoad(long started, int roads) {
       double total = (double)(System.nanoTime() - started) / 1000000.0;
       if (total >= 100.0 || Boolean.getBoolean("sr.profile")) {
-         LOG.log(Level.INFO, "SR load: {0} ms, roads={1}", Math.round(total), roads);
+         LOG.info("SR load: {} ms, roads={}", Math.round(total), roads);
       }
    }
 }

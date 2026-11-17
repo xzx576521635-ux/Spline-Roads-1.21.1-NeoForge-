@@ -55,7 +55,12 @@ public final class RoadMarkerBuilder {
    private static final Set<Long> adoptedChunks = new HashSet<>();
    private static final ArrayDeque<Long> RECONCILE = new ArrayDeque<>();
    private static final Set<Long> reconcileQueued = new HashSet<>();
-   private static final Map<RoadIndex.Built, Map<Long, Map<Long, RoadMarker.Kind>>> CHUNK_LAYOUTS = Collections.synchronizedMap(new WeakHashMap<>());
+   private static final Map<UUID, RoadMarkerBuilder.ChunkLayout> CHUNK_LAYOUTS = new LinkedHashMap<>(64, 0.75F, true) {
+   @Override
+   protected boolean removeEldestEntry(Map.Entry<UUID, RoadMarkerBuilder.ChunkLayout> eldest) {
+      return this.size() > 128;
+   }
+};
    private static boolean pendingRestored;
    private static int loadTick;
    private static int reconcileLoadTick;
@@ -63,6 +68,9 @@ public final class RoadMarkerBuilder {
    private static final Set<Long> nudgedChunks = new HashSet<>();
    private static final ArrayDeque<Nudge> NUDGES = new ArrayDeque<>();
    private static int reconcileCooldown;
+   private static final ArrayDeque<UUID> REBUILD = new ArrayDeque<>();
+   private static boolean coverageChecked;
+   private static final org.apache.logging.log4j.Logger PERF = org.apache.logging.log4j.LogManager.getLogger("SplineRoads/performance");
 
    private RoadMarkerBuilder() {
    }
@@ -86,6 +94,8 @@ public final class RoadMarkerBuilder {
          reconcileCooldown = 0;
          CHUNK_LAYOUTS.clear();
          pendingRestored = false;
+         REBUILD.clear();
+         coverageChecked = false;
       }
 
       if (records == null && level != null) {
@@ -127,14 +137,60 @@ public final class RoadMarkerBuilder {
       if (!pendingRestored) {
          pendingRestored = true;
          loadTick = 0;
+         PERF.info("SR markers: ledger roads={}, pendingRemovals={}", records.roads().size(), records.pendingCount());
 
-         for (long pos : records.pending()) {
-            if (queuedRemovals.add(pos)) {
-               REMOVALS.add(new Removal(BlockPos.of(pos), null));
+         if (!records.backlogDropped()) {
+            int dropped = records.dropPendingBacklog();
+            REMOVALS.clear();
+            queuedRemovals.clear();
+            PERF.info(
+               "SR markers: dropped legacy removal backlog ({} entries); orphan markers are now detected per chunk",
+               dropped
+            );
+         }
+      }
+
+      // Feed the persisted removal backlog in bounded slices. It used to be copied with
+      // Set.copyOf and turned into Removal objects in one tick, which froze world entry for
+      // minutes when the backlog reached about a million positions.
+      if (REMOVALS.size() < 2048) {
+         for (long backlogPos : records.takePending(2048)) {
+            BlockPos backlogBlock = BlockPos.of(backlogPos);
+
+            if (!level.isLoaded(backlogBlock)) {
+               // Chunk is not loaded: don't force synchronous chunk generation for backlog
+               // cleanup. adoptChunk() removes the marker (if any) the next time the chunk
+               // loads, so dropping the ledger entry here is safe.
+               continue;
+            }
+
+            if (queuedRemovals.add(backlogPos)) {
+               REMOVALS.add(new Removal(backlogBlock, null));
             }
          }
       }
 
+      // One-time recovery: if the ledger only covers a minority of the roads (the old
+      // removal backlog stripped most entries), schedule a background rebuild of all marker
+      // layouts so the map gets its colours back.
+      if (!coverageChecked && !data.index.roads.isEmpty()) {
+         coverageChecked = true;
+         int covered = 0;
+
+         for (UUID id : data.index.roads.keySet()) {
+            if (!records.positions(id).isEmpty()) {
+               covered++;
+            }
+         }
+
+         if (covered > 0 && covered * 2 < data.index.roads.size() && !records.rebuilt()) {
+            PERF.info("SR markers: ledger covers {}/{} roads; scheduling rebuild", covered, data.index.roads.size());
+            records.rebuilt(true);
+            scheduleRebuild(data, "low ledger coverage");
+         }
+      }
+
+      rebuildBudget(data);
       removeBudget();
 
       if (!QUEUE.isEmpty()) {
@@ -150,10 +206,114 @@ public final class RoadMarkerBuilder {
       nudgeBudget();
    }
 
+   /** Queues a full marker layout rebuild for every road (background, budgeted). */
+   public static int scheduleRebuild(RoadData data, String reason) {
+      REBUILD.clear();
+
+      for (UUID id : data.index.roads.keySet()) {
+         REBUILD.add(id);
+      }
+
+      if (records != null) {
+         records.rebuilt(true);
+      }
+
+      PERF.info("SR markers: rebuild scheduled ({}) roads={}", reason, REBUILD.size());
+      return REBUILD.size();
+   }
+
+   private static void rebuildBudget(RoadData data) {
+      if (REBUILD.isEmpty()) {
+         return;
+      }
+
+      long deadline = System.nanoTime() + 5_000_000L;
+      int roads = 0;
+
+      while (!REBUILD.isEmpty() && roads < 16 && System.nanoTime() < deadline && QUEUE.size() < MAX_MARKERS) {
+         UUID id = REBUILD.removeFirst();
+         RoadIndex.Built road = data.index.roads.get(id);
+         if (road == null) {
+            continue;
+         }
+
+         roads++;
+
+         // Only structures (trees, lamps, rails, medians, piers). Lane paint lives on the top
+         // collider block state, so it needs no marker blocks; skipping the full road surface
+         // build keeps the rebuild cheap (no multi-second layout per road).
+         LinkedHashMap<Long, Placement> markers = new LinkedHashMap<>();
+
+         try {
+            queueRoad(markers, road);
+         } catch (Throwable ignored) {
+         }
+
+         for (Placement placement : markers.values()) {
+            if (QUEUE.size() >= MAX_MARKERS) {
+               break;
+            }
+
+            QUEUE.addLast(placement);
+         }
+      }
+
+      if (REBUILD.isEmpty()) {
+         PERF.info("SR markers: rebuild finished queueing, placements pending={}", QUEUE.size());
+      }
+   }
+
+   /**
+    * Returns the road that owns a position when the marker sits next to its surface: the
+    * carriageway, a sidewalk, or the furniture above it (trees and lamps up to ~16 blocks
+    * high, ~8 blocks to the side). Used to keep markers that a partial ledger no longer lists.
+    */
+   private static UUID nearestRoad(BlockPos pos, Collection<RoadIndex.Built> roads) {
+      double x = (double)pos.getX() + 0.5;
+      double y = (double)pos.getY() + 0.5;
+      double z = (double)pos.getZ() + 0.5;
+      RoadGeometry.V point = new RoadGeometry.V(x, y, z);
+      UUID best = null;
+      double bestLateral = Double.MAX_VALUE;
+
+      for (RoadIndex.Built road : roads) {
+         if (x < road.mesh.min().x() - 10.0
+            || x > road.mesh.max().x() + 10.0
+            || z < road.mesh.min().z() - 10.0
+            || z > road.mesh.max().z() + 10.0
+            || y < road.mesh.min().y() - 16.0
+            || y > road.mesh.max().y() + 16.0) {
+            continue;
+         }
+
+         RoadQueries.Projection projection = RoadQueries.horizontal(road.mesh, point);
+         if (projection == null) {
+            continue;
+         }
+
+         double lateral = Math.abs(projection.lateral());
+         if (lateral <= projection.sample().halfWidth() + 8.0
+            && Math.abs(projection.sample().center().y() - y) <= 16.0
+            && lateral < bestLateral) {
+            bestLateral = lateral;
+            best = road.record.id();
+         }
+      }
+
+      return best;
+   }
+
    private static void queueAll(RoadData data) {
       LinkedHashMap<Long, Placement> markers = new LinkedHashMap<>();
 
       for (RoadIndex.Built road : data.index.roads.values()) {
+         // Roads with ledger positions already have their markers placed; adoptChunk()
+         // re-creates any missing block per chunk. Recomputing the full layout for every
+         // road at load built up to 200k Placement objects and dominated world entry.
+         if (records != null && !records.positions(road.record.id()).isEmpty()) {
+            continue;
+         }
+
          try {
             queueRoad(markers, road);
          } catch (Throwable ignored) {
@@ -288,17 +448,196 @@ public final class RoadMarkerBuilder {
       }
    }
 
-   private static Map<Long, Map<Long, RoadMarker.Kind>> byChunk(RoadIndex.Built road) {
-      return CHUNK_LAYOUTS.computeIfAbsent(road, r -> {
-         HashMap<Long, Map<Long, RoadMarker.Kind>> out = new HashMap<>();
+   /**
+    * Removes marker blocks inside {@code chunk} that no existing road covers any more.
+    * Markers still owned by an existing road, or still next to a road surface (trees, lamps,
+    * piers), are kept. Returns the number of removed blocks.
+    */
+   public static int cleanChunk(ServerLevel world, ChunkPos chunk, boolean apply, Map<RoadMarker.Kind, Integer> histogram) {
+      if (records == null) {
+         records = RoadMarkerData.get(world);
+      }
 
-         for (Map.Entry<Long, RoadMarker.Kind> entry : layout(r).entrySet()) {
-            long chunk = ChunkPos.asLong(BlockPos.getX(entry.getKey()) >> 4, BlockPos.getZ(entry.getKey()) >> 4);
-            out.computeIfAbsent(chunk, key -> new LinkedHashMap<>()).put(entry.getKey(), entry.getValue());
+      if (records == null) {
+         return 0;
+      }
+
+      RoadData data = RoadData.get(world);
+      if (data == null) {
+         return 0;
+      }
+
+      ChunkAccess access = world.getChunkSource().getChunk(chunk.x, chunk.z, ChunkStatus.FULL, false);
+      if (access == null) {
+         return 0;
+      }
+
+      ArrayList<BlockPos> found = new ArrayList<>();
+      access.findBlocks(
+         state -> state.is((Block)SplineRoads.MARKER.get()),
+         (state, pos) -> true,
+         (pos, state) -> found.add(pos.immutable())
+      );
+
+      if (found.isEmpty()) {
+         return 0;
+      }
+
+      HashSet<UUID> ids = new HashSet<>();
+
+      for (int dx = -2; dx <= 2; dx++) {
+         for (int dz = -2; dz <= 2; dz++) {
+            ids.addAll(data.index.inChunk(ChunkPos.asLong(chunk.x + dx, chunk.z + dz)));
+         }
+      }
+
+      List<RoadIndex.Built> nearby = ids.stream().map(data.index.roads::get).filter(Objects::nonNull).toList();
+      int removed = 0;
+
+      for (BlockPos pos : found) {
+         // The chunk scan can report cells whose current block is no longer a marker (the
+         // chunk may have changed since the palette walk). Never read marker properties or
+         // place air unless the live block really is a road marker.
+         BlockState current = world.getBlockState(pos);
+         if (!current.is((Block)SplineRoads.MARKER.get())) {
+            continue;
          }
 
-         return out;
-      });
+         long key = pos.asLong();
+         Set<UUID> owners = records.roadsAt(key);
+         boolean currentOwner = false;
+
+         for (UUID id : owners) {
+            if (data.index.roads.containsKey(id)) {
+               currentOwner = true;
+               break;
+            }
+         }
+
+         if (!currentOwner && nearCurrentRoad(pos, nearby)) {
+            // Untracked, but still part of a road's furniture (canopy, lamp head, pier).
+            continue;
+         }
+
+         if (currentOwner) {
+            continue;
+         }
+
+         removed++;
+
+         if (histogram != null) {
+            histogram.merge(current.getValue(RoadMarker.KIND), 1, Integer::sum);
+         }
+
+         if (!apply) {
+            continue;
+         }
+
+         world.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
+
+         if (!owners.isEmpty() || records.isPending(key)) {
+            records.complete(key);
+         }
+      }
+
+      return removed;
+   }
+
+   /** Prunes unowned/leftover marker blocks in loaded chunks around {@code center}. */
+   public static int pruneUntracked(
+      ServerLevel world, BlockPos center, int radius, boolean apply, Map<RoadMarker.Kind, Integer> histogram
+   ) {
+      int chunkRadius = Math.max(1, (radius + 15) / 16);
+      int cx = center.getX() >> 4;
+      int cz = center.getZ() >> 4;
+      int removed = 0;
+
+      for (int x = cx - chunkRadius; x <= cx + chunkRadius; x++) {
+         for (int z = cz - chunkRadius; z <= cz + chunkRadius; z++) {
+            if (world.hasChunk(x, z)) {
+               removed += cleanChunk(world, new ChunkPos(x, z), apply, histogram);
+            }
+         }
+      }
+
+      return removed;
+   }
+
+   /**
+    * Generous "is this still part of a road" test: carriageway/sidewalk width plus furniture
+    * margin laterally, and a very tall vertical window so bridge piers and canopy markers stay.
+    */
+   private static boolean nearCurrentRoad(BlockPos pos, Collection<RoadIndex.Built> roads) {
+      double x = (double)pos.getX() + 0.5;
+      double y = (double)pos.getY() + 0.5;
+      double z = (double)pos.getZ() + 0.5;
+      RoadGeometry.V point = new RoadGeometry.V(x, y, z);
+
+      for (RoadIndex.Built road : roads) {
+         try {
+            if (road.mesh.samples().isEmpty()
+               || x < road.mesh.min().x() - 10.0
+               || x > road.mesh.max().x() + 10.0
+               || z < road.mesh.min().z() - 10.0
+               || z > road.mesh.max().z() + 10.0) {
+               continue;
+            }
+
+            RoadQueries.Projection projection = RoadQueries.horizontal(road.mesh, point);
+            if (projection == null) {
+               continue;
+            }
+
+            double lateral = Math.abs(projection.lateral());
+            double centerY = projection.sample().center().y();
+
+            if (lateral <= projection.sample().halfWidth() + 24.0 && y >= centerY - 512.0 && y <= centerY + 128.0) {
+               return true;
+            }
+         } catch (RuntimeException ignored) {
+            // A degenerate mesh must never abort an orphan audit.
+         }
+      }
+
+      return false;
+   }
+
+   private static Map<Long, Map<Long, RoadMarker.Kind>> byChunk(RoadIndex.Built road) {
+      UUID id = road.record.id();
+      ChunkLayout cached = CHUNK_LAYOUTS.get(id);
+
+      if (cached != null && cached.record == road.record) {
+         return cached.byChunk;
+      }
+
+      // Prefer the recorded ledger: recomputing layout(r) builds the whole road surface
+      // geometry and its furniture placements, which used to cost seconds per chunk load.
+      // The cache is keyed by road id and validated against the (immutable) record identity,
+      // so road edits recompute and GC cannot silently drop the result.
+      Map<Long, RoadMarker.Kind> source = records == null ? Map.of() : records.positions(id);
+      if (source.isEmpty()) {
+         source = layout(road);
+      }
+
+      HashMap<Long, Map<Long, RoadMarker.Kind>> out = new HashMap<>();
+
+      for (Map.Entry<Long, RoadMarker.Kind> entry : source.entrySet()) {
+         long chunk = ChunkPos.asLong(BlockPos.getX(entry.getKey()) >> 4, BlockPos.getZ(entry.getKey()) >> 4);
+         out.computeIfAbsent(chunk, key -> new LinkedHashMap<>()).put(entry.getKey(), entry.getValue());
+      }
+
+      CHUNK_LAYOUTS.put(id, new ChunkLayout(road.record, out));
+      return out;
+   }
+
+   private static final class ChunkLayout {
+      final RoadRecord record;
+      final Map<Long, Map<Long, RoadMarker.Kind>> byChunk;
+
+      ChunkLayout(RoadRecord record, Map<Long, Map<Long, RoadMarker.Kind>> byChunk) {
+         this.record = record;
+         this.byChunk = byChunk;
+      }
    }
 
    /**
@@ -338,7 +677,9 @@ public final class RoadMarkerBuilder {
             }
          }
 
-         records.remove(id);
+         if (records.positions(id).isEmpty()) {
+            records.remove(id);
+         }
       }
    }
 
@@ -376,10 +717,10 @@ public final class RoadMarkerBuilder {
    /**
     * Read-only adoption of markers placed by older versions, plus orphan detection.
     *
-    * <p>Markers close enough to a current road are recorded to that road. Markers that are
-    * far away from every current road are leftovers from roads deleted before the marker
-    * ledger existed and are queued for removal. Adoption only reads blocks; the removal
-    * queue deletes them later, budgeted.</p>
+    * <p>Markers close enough to a current road are recorded to that road. Markers that do not
+    * match the ledger are kept as they are: road deletion already removes the markers it
+    * recorded, so an unknown marker is not proof of an orphan. Explicit cleanup is available
+    * through {@code /sr markers prune}.</p>
     */
    static void adoptChunk(ServerLevel world, ChunkPos chunk, List<RoadIndex.Built> nearby) {
       if (records == null) {
@@ -398,16 +739,11 @@ public final class RoadMarkerBuilder {
 
       HashMap<Long, RoadMarker.Kind> desired = new HashMap<>();
       HashMap<Long, UUID> owners = new HashMap<>();
+      // The caller already passes every road in the 5x5 chunk neighbourhood, which covers
+      // markers that sit a little outside their road's own chunks. Scanning all roads of the
+      // world here forced a full marker layout (road surface + furniture) for roads that had
+      // no ledger records yet: one chunk load could take more than ten seconds.
       HashSet<RoadIndex.Built> candidates = new HashSet<>(nearby);
-      RoadData data = RoadData.get(world);
-
-      if (data != null) {
-         for (RoadIndex.Built road : data.index.roads.values()) {
-            if (byChunk(road).containsKey(chunk.toLong())) {
-               candidates.add(road);
-            }
-         }
-      }
 
       for (RoadIndex.Built road : candidates) {
          for (Map.Entry<Long, RoadMarker.Kind> entry : byChunk(road).getOrDefault(chunk.toLong(), Map.of()).entrySet()) {
@@ -441,6 +777,17 @@ public final class RoadMarkerBuilder {
                }
                continue;
             }
+
+            // Keep markers that are still next to a current road even when the exact cell is
+            // not in the ledger (partial ledger, older denser layouts, offsets). Removing
+            // those is what turned a colourful map into a sparse grey one.
+            if (actual != null) {
+               UUID roadOwner = nearestRoad(pos, candidates);
+               if (roadOwner != null) {
+                  records.add(roadOwner, key, actual);
+                  continue;
+               }
+            }
          }
 
          if (want != null) {
@@ -450,17 +797,20 @@ public final class RoadMarkerBuilder {
                // Same cell is needed by a remaining road with another kind: convert the
                // marker instead of deleting it, so nearby roads never lose their detail.
                BlockState converted = SplineRoads.MARKER.get().defaultBlockState().setValue(RoadMarker.KIND, want);
-               world.setBlock(pos, converted, 3);
+               world.setBlock(pos, converted, 2);
             }
 
             UUID owner = owners.get(key);
             if (owner != null) {
                records.add(owner, key, want);
             }
-         } else if (queuedRemovals.add(key)) {
-            REMOVALS.add(new Removal(pos, null));
-            records.addPending(key);
          }
+         // No removal here: deleting a road already removes exactly the markers it recorded,
+         // so a marker that is not in the ledger is not necessarily an orphan. Queuing it
+         // deleted markers that the rebuild had just placed (the removal scan even looks up
+         // to five blocks above the recorded position, so it also hit freshly rebuilt cells).
+         // Leftover markers from roads deleted before the ledger existed can be cleaned with
+         // /sr markers prune, which is explicit and chunk-scoped.
       }
 
       for (Map.Entry<Long, RoadMarker.Kind> entry : desired.entrySet()) {
@@ -487,7 +837,7 @@ public final class RoadMarkerBuilder {
          // Place immediately: the chunk is being loaded/watched right now, and Xaero
          // samples it during this window. Queueing would make the first sample colourless.
          BlockState marker = SplineRoads.MARKER.get().defaultBlockState().setValue(RoadMarker.KIND, entry.getValue());
-         level.setBlock(pos, marker, 3);
+         world.setBlock(pos, marker, 2);
          cancelRemoval(key);
          UUID owner = owners.get(key);
          if (owner != null) {
@@ -506,7 +856,7 @@ public final class RoadMarkerBuilder {
             if (state.is((Block)SplineRoads.MARKER.get())) {
                RoadMarker.Kind original = state.getValue(RoadMarker.KIND);
                RoadMarker.Kind temporary = original == RoadMarker.Kind.CONCRETE ? RoadMarker.Kind.STEEL : RoadMarker.Kind.CONCRETE;
-               world.setBlock(pos, state.setValue(RoadMarker.KIND, temporary), 3);
+               world.setBlock(pos, state.setValue(RoadMarker.KIND, temporary), 2);
                NUDGES.add(new Nudge(pos, original, 1));
                break;
             }
@@ -528,7 +878,7 @@ public final class RoadMarkerBuilder {
          BlockState state = level.getBlockState(nudge.pos);
 
          if (state.is((Block)SplineRoads.MARKER.get())) {
-            level.setBlock(nudge.pos, state.setValue(RoadMarker.KIND, nudge.kind), 3);
+            level.setBlock(nudge.pos, state.setValue(RoadMarker.KIND, nudge.kind), 2);
          }
       }
    }
@@ -624,7 +974,9 @@ public final class RoadMarkerBuilder {
    }
 
    private static void removeBudget() {
-      int budget = REMOVE_BUDGET_PER_TICK;
+      // Backlogs from deleted roads are drained faster; each removal is a handful of block
+      // reads, so 4096/tick is still cheap compared to one frozen world load.
+      int budget = REMOVALS.size() > 8192 ? 4096 : REMOVE_BUDGET_PER_TICK;
 
       while (budget-- > 0 && !REMOVALS.isEmpty()) {
          Removal removal = REMOVALS.removeFirst();
@@ -656,7 +1008,13 @@ public final class RoadMarkerBuilder {
             BlockState state = level.getBlockState(p);
             if (state.is((Block)SplineRoads.MARKER.get())
                && (removal.kind == null || state.getValue(RoadMarker.KIND) == removal.kind)) {
-               level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+               if (ownedByCurrentRoad(p)) {
+                  // The column scan can reach markers of a road that still exists (bridges,
+                  // overhead crossings, rebuilt layouts). Never delete those.
+                  continue;
+               }
+
+               level.setBlock(p, Blocks.AIR.defaultBlockState(), 2);
                break;
             }
          }
@@ -664,7 +1022,34 @@ public final class RoadMarkerBuilder {
          if (records != null) {
             records.complete(removal.pos.asLong());
          }
+
+         queuedRemovals.remove(removalKey);
       }
+   }
+
+   /** True when a marker block still belongs to a road that exists in the index. */
+   private static boolean ownedByCurrentRoad(BlockPos pos) {
+      if (records == null || level == null) {
+         return false;
+      }
+
+      Set<UUID> owners = records.roadsAt(pos.asLong());
+      if (owners.isEmpty()) {
+         return false;
+      }
+
+      RoadData data = RoadData.get(level);
+      if (data == null) {
+         return false;
+      }
+
+      for (UUID id : owners) {
+         if (data.index.roads.containsKey(id)) {
+            return true;
+         }
+      }
+
+      return false;
    }
 
    private static void queuePart(Map<Long, Placement> markers, RoadStructures.Part part, RoadMarker.Kind kind, UUID owner) {
@@ -883,7 +1268,7 @@ public final class RoadMarkerBuilder {
 
          BlockState marker = SplineRoads.MARKER.get().defaultBlockState().setValue(RoadMarker.KIND, placement.kind);
          if (current != marker) {
-            level.setBlock(pos, marker, 3);
+            level.setBlock(pos, marker, 2);
          }
 
          cancelRemoval(pos.asLong());

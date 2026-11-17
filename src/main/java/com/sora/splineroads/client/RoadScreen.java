@@ -550,6 +550,42 @@ public final class RoadScreen extends Screen {
          );
    }
 
+   /** Panel geometry for add-ons that extend the screen (material bill). */
+   public int panelLeft() {
+      return this.left;
+   }
+
+   public int panelTop() {
+      return this.top;
+   }
+
+   public int panelWidth() {
+      return 288;
+   }
+
+   /** Real right edge (advanced layout shows a second column at left + 294). */
+   public int panelRight() {
+      return this.width >= 512 ? this.left + 494 : this.left + 288;
+   }
+
+   public int panelHeight() {
+      return 238;
+   }
+
+   /** Settings for add-ons (material bills etc.); {@code null} while the form is incomplete. */
+   public RoadGeometry.Settings currentSettingsOrNull() {
+      try {
+         return this.settings();
+      } catch (RuntimeException error) {
+         return null;
+      }
+   }
+
+   /** The raw draft payload (contains {@code A} / {@code B} endpoint positions). */
+   public CompoundTag draftTag() {
+      return this.payload;
+   }
+
    private RoadGeometry.Settings settings() {
       if (!this.capture()) {
          throw new IllegalArgumentException("请填写完整数值");

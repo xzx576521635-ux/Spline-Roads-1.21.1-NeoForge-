@@ -77,6 +77,7 @@ public final class ClientRoads {
    private static long coldSyncAcks;
    private static int joinTicks;
    private static boolean wideSyncSent;
+   private static int wideSyncStage;
    private static long lastWideSyncTick;
    private static double wideSyncX;
    private static double wideSyncZ;
@@ -242,6 +243,7 @@ public final class ClientRoads {
       coldSync.clear();
       joinTicks = 0;
       wideSyncSent = false;
+      wideSyncStage = 0;
       lastWideSyncTick = 0L;
       wideSyncX = 0.0;
       wideSyncZ = 0.0;
@@ -1103,13 +1105,35 @@ public final class ClientRoads {
       double x = mc.player.getX();
       double z = mc.player.getZ();
       long now = level.getGameTime();
-      boolean due = !wideSyncSent
-         || now - lastWideSyncTick >= 200L
-            && (x - wideSyncX) * (x - wideSyncX) + (z - wideSyncZ) * (z - wideSyncZ) >= 16384.0;
-      if (joinTicks < 40 || !due) {
+      if (joinTicks < 40) {
          return;
       }
 
+      // World entry used to ask for the whole DH band at once, which queued thousands of
+      // road meshes while the client was still building the near chunks. Stream it in two
+      // steps instead: first a modest ring, then the configured radius once the queue is idle.
+      if (wideSyncStage == 0) {
+         if (!RoadRenderer.buildQueueIdle() && joinTicks < 400) {
+            return;
+         }
+
+         wideSyncStage = 1;
+         wideSyncSent = true;
+         lastWideSyncTick = now;
+         wideSyncX = x;
+         wideSyncZ = z;
+         RoadNetwork.requestWideSync(Math.min(radius, 12));
+         return;
+      }
+
+      boolean moved = (x - wideSyncX) * (x - wideSyncX) + (z - wideSyncZ) * (z - wideSyncZ) >= 16384.0;
+      boolean due = moved && now - lastWideSyncTick >= 200L;
+      boolean expand = wideSyncStage == 1 && RoadRenderer.buildQueueIdle() && now - lastWideSyncTick >= 100L;
+      if (!due && !expand) {
+         return;
+      }
+
+      wideSyncStage = 2;
       wideSyncSent = true;
       lastWideSyncTick = now;
       wideSyncX = x;

@@ -11,6 +11,12 @@ public final class RoadUploadBudget {
    private static final int UNIT_BYTES = 294912;
    private static final int FRAME_BYTES = 1179648;
    private static final int MAX_SIGN_BYTES = 16777216;
+   /**
+    * Roads must always be able to upload at least one vertex buffer per frame. Without this
+    * floor the sign reservation could consume the whole frame budget, so every road section
+    * that became dirty (rebuilt, relit) could never upload again and stayed invisible.
+    */
+   private static final int MIN_ROAD_BYTES = 524288;
    private static boolean active;
    private static boolean uploadsAllowed;
    private static int signReserve;
@@ -59,29 +65,48 @@ public final class RoadUploadBudget {
          return false;
       } else {
          int used = roadBytes + signBytes;
-         int own = sign ? signUploads : roadUploads;
-         if (sign && signReserve > 1179648 && signUploads == 0 && bytes < signReserve) {
-            return false;
+         if (sign) {
+            // Big sign plates may use a whole frame on their own (nothing else uploaded yet in
+            // this frame); otherwise every upload shares the frame budget.
+            boolean largePlate = bytes <= MAX_SIGN_BYTES && used < FRAME_BYTES;
+            if (!largePlate && used + bytes > FRAME_BYTES) {
+               return false;
+            }
          } else {
-            int limit = sign ? 1179648 : Math.max(0, 1179648 - signReserve);
-            boolean largePlate = sign && bytes > 1179648 && bytes <= 16777216 && used == 0;
-            if (!largePlate && used + bytes > limit) {
+            // Reserve room for signs, but never below one road buffer per frame.
+            int roadLimit = Math.max(MIN_ROAD_BYTES, FRAME_BYTES - signReserve);
+            if (roadBytes + bytes > roadLimit) {
                return false;
-            } else if (own > 0 && System.nanoTime() >= deadline) {
-               return false;
-            } else {
-               if (sign) {
-                  signBytes += bytes;
-                  signUploads++;
-               } else {
-                  roadBytes += bytes;
-                  roadUploads++;
-               }
-
-               return true;
             }
          }
+
+         if (used > 0 && System.nanoTime() >= deadline) {
+            return false;
+         } else {
+            if (sign) {
+               signBytes += bytes;
+               signUploads++;
+            } else {
+               roadBytes += bytes;
+               roadUploads++;
+            }
+
+            return true;
+         }
       }
+   }
+
+   static String debug() {
+      return "active="
+         + active
+         + " allowed="
+         + uploadsAllowed
+         + " reserve="
+         + signReserve
+         + " roadLimit="
+         + Math.max(MIN_ROAD_BYTES, FRAME_BYTES - signReserve)
+         + " deadline="
+         + (deadline == 0L ? "-" : (System.nanoTime() < deadline ? "open" : "passed"));
    }
 
    static String metrics() {
